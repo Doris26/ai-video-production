@@ -51,12 +51,63 @@ CHARACTERS = {
     "keiko": {
         "face_prompt": "Hyper-realistic close-up portrait headshot, beautiful young Japanese woman aged 24, wispy messy bangs, long dark brown hair, large expressive brown eyes, smooth porcelain skin, natural blush, small nose, pink glossy lips, confident gentle smile, wearing gray suit jacket and white blouse, plain light gray background, 8K",
         "desc": "same beautiful young Japanese woman aged 24, wispy bangs, long dark brown hair, large symmetric brown eyes, smooth porcelain skin, pink lips",
+        # Voice asset — Edge-TTS voice for this character
+        "voice": "zh-CN-XiaoyiNeural",  # Young female, warm and gentle
+        "voice_rate": "-10%",
+        "voice_pitch": "+2Hz",
     },
     "kuroda": {
         "face_prompt": "Hyper-realistic close-up portrait headshot, tall Japanese male student aged 18, short spiky jet-black hair, sharp narrow dark eyes, strong defined jawline, intimidating confident expression, wearing dark navy school uniform gakuran collar unbuttoned, plain light gray background, 8K",
         "desc": "tall Japanese male student aged 18, short spiky black hair, sharp dark eyes, strong jawline, dark navy school uniform gakuran",
+        # Voice asset — Edge-TTS voice for this character
+        "voice": "zh-CN-YunxiNeural",  # Young male, cold and low
+        "voice_rate": "-5%",
+        "voice_pitch": "-5Hz",
+    },
+    # Narrator (if needed)
+    "narrator": {
+        "voice": "zh-CN-YunxiNeural",
+        "voice_rate": "-15%",
+        "voice_pitch": "-8Hz",
     },
 }
+
+# ═══════════════════════════════════════════════════════
+# VOICE / AUDIO GENERATION
+# ═══════════════════════════════════════════════════════
+
+async def generate_voice(text, character_name, output_path):
+    """Generate speech for a character using their voice asset."""
+    import edge_tts
+    char = CHARACTERS.get(character_name, CHARACTERS["narrator"])
+    comm = edge_tts.Communicate(
+        text,
+        voice=char["voice"],
+        rate=char.get("voice_rate", "-10%"),
+        pitch=char.get("voice_pitch", "0Hz"),
+    )
+    await comm.save(output_path)
+
+
+def generate_all_audio(script_lines, output_dir):
+    """
+    Generate audio for all script lines.
+    script_lines: list of (character_name, text) tuples
+    """
+    import asyncio
+    audio_dir = Path(output_dir) / "audio"
+    audio_dir.mkdir(exist_ok=True)
+
+    async def _gen():
+        for i, (char, text) in enumerate(script_lines):
+            out = audio_dir / f"{i:03d}_{char}.mp3"
+            if out.exists():
+                continue
+            print(f"  [audio {i:03d}] {char}: {text[:30]}...")
+            await generate_voice(text, char, str(out))
+
+    asyncio.run(_gen())
+    print(f"  Audio files in {audio_dir}/")
 
 # ═══════════════════════════════════════════════════════
 # SCENES
