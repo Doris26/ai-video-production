@@ -35,7 +35,13 @@ ASSET_DIR = Path("/tmp/banana_assets")
 
 # Style anchoring — appended to EVERY Banana Pro prompt
 STYLE_ANCHOR = "smooth skin texture, clean detailed rendering, consistent bright lighting, same art style as reference image, hyper-realistic, NOT cartoon, NOT dark, NOT gritty, NOT anime, 8K"
-NEG_GLOBAL = "ugly, deformed, cartoon, chibi, Disney, Pixar, blurry, cute, kawaii, Western, European, blonde, anime, asymmetric eyes, glasses, dark mood, rough texture, grainy"
+# Negative prompt — ALWAYS include these to prevent common issues:
+# - "cartoon, chibi, Disney, Pixar, anime" → prevents style drift
+# - "glasses, spectacles, reading glasses" → Banana Pro adds glasses randomly
+# - "asymmetric eyes, cross-eyed" → prevents eye deformation
+# - "Western, European, blonde" → keeps Japanese face
+# - "dark mood, rough texture, grainy" → keeps consistent bright clean look
+NEG_GLOBAL = "ugly, deformed, cartoon, chibi, Disney, Pixar, blurry, cute, kawaii, Western, European, blonde, anime, asymmetric eyes, cross-eyed, glasses, spectacles, reading glasses, dark mood, rough texture, grainy"
 
 # ═══════════════════════════════════════════════════════
 # CHARACTERS
