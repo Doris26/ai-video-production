@@ -99,50 +99,240 @@ workflow = {
 - `images/swapped/` — 21 face-swapped images (4 epic + 17 classroom)
 - `images/reactor_*.png` — 4 test scene swaps (cafe, beach, sakura, city)
 
+## Detailed Pipeline Flow
+
+```
+Step 0: STORYBOARD (JSON — source of truth)
+    ▼   QA: duration fits, voice_text ≤ duration×5 chars, no overlapping voices
+Step 1: ASSETS (characters + scenes + props + voice + SFX)
+    ▼   QA: face symmetric, no glasses, identity consistent across angles
+Step 2: IMAGES (Banana Pro with face ref + style anchor)
+    ▼   QA: Rules 1-6 (face, style, background) — auto-retry ≤5x
+Step 3: STRIP + FACE SWAP (explicit scenes only)
+    ▼   QA: Rules 7-8 (clothing removed, classroom kept) + Rules 1-3 (face)
+Step 4: AUDIO (Edge-TTS per character + real SFX)
+    ▼   QA: Rules 13-14 (correct voice, no artifacts)
+Step 5: VIDEO (STATIC / SEEDANCE / WAN per scene)
+    ▼   QA: Rules 9-12 (motion, artifacts, face stable, filter)
+Step 6: MIX (video + voice + ambient + SFX → per scene)
+    ▼   QA: sync, volume, no clipping
+Step 7: STITCH (concat all → final video)
+    ▼   QA: plays ok, total duration, no transition glitches
+```
+
+### Storyboard Format (Step 0)
+
+```json
+{
+  "scene_id": "01a",
+  "duration": 5,
+  "image_desc": "Woman walking through school gate, cherry blossoms",
+  "voice_type": "NARRATION | WOMEN_TALKING | MOANING | SILENCE",
+  "voice_text": "景子到任后立即成为学生的偶像。",
+  "voice_character": "narrator | keiko | kuroda",
+  "sfx": "morning_ambient | moaning_light | null",
+  "video_type": "STATIC | SEEDANCE | WAN",
+  "motion_prompt": "subtle head turn, gentle smile",
+  "explicit": false
+}
+```
+
+Rules:
+- `voice_text` fits duration (5s ≈ 25 Chinese chars)
+- Long narration → split into sub-scenes (01a, 01b, 01c)
+- Voice: EITHER narration OR dialogue — **NEVER overlapping**
+- `explicit: true` → `video_type: WAN` (Seedance filters NSFW)
+- `STATIC` = Ken Burns zoom/pan (free, no API)
+
+### Asset Categories (Step 1)
+
+| Category | What | Example |
+|----------|------|---------|
+| **Characters (角色)** | Face + fullbody + side per character | `keiko_face.png`, `keiko_fullbody.png` |
+| **Scenes (场景)** | Location backgrounds | Classroom, hallway, school gate |
+| **Props (道具)** | Consistent objects across scenes | Textbook, briefcase, chalk, coffee cup |
+| **Voice** | Edge-TTS config per character | `zh-CN-XiaoyiNeural` rate:-10% pitch:+2Hz |
+| **SFX** | Real audio clips for intimate scenes | `assets/voice_real/gfx_0.mp3` |
+
+Character asset flow: Face (txt2img) → Fullbody (img2img strength=0.55) → Side (img2img strength=0.45)
+
+### Image Generation (Step 2)
+
+**Style Anchor** (EVERY prompt):
+```
+smooth skin texture, clean detailed rendering, consistent bright lighting,
+same art style as reference image, hyper-realistic, NOT cartoon, NOT anime, 8K
+```
+
+**Global Negative** (ALWAYS):
+```
+ugly, deformed, cartoon, chibi, Disney, Pixar, blurry, cute, kawaii,
+Western, blonde, anime, asymmetric eyes, glasses, dark mood, rough texture, grainy
+```
+
+Banana Pro params: strength=0.50, steps=30, guidance=7.0, 1024x1024
+
+### Video Types (Step 5)
+
+| Type | When | How | Cost |
+|------|------|-----|------|
+| **STATIC** | Narration, close-ups | Ken Burns zoom/pan (FFmpeg) | Free |
+| **SEEDANCE** | Clean motion scenes | ByteDance Ark API (`doubao-seedance-1-5-pro`) | ~$0.01 |
+| **WAN** | Explicit motion scenes | ComfyUI on g6e.2xlarge (L40S, **64GB RAM required**) | ~$0.15 |
+
+Ken Burns: `ffmpeg -loop 1 -i img.png -vf "zoompan=z='min(zoom+0.001,1.3)':d=125:s=1024x1024" -t 5 out.mp4`
+
+Wan2.1: UNETLoader → CLIPVisionEncode → WanImageToVideo[0,1,2] → KSampler(25 steps) → VAEDecode
+
+### Audio Pipeline (Step 4 + Step 6)
+
+**3-layer mixing per scene:**
+
+| Layer | Source | Volume |
+|-------|--------|--------|
+| Voice | Edge-TTS (per character) | Full (1.0) |
+| Ambient | Seedance original or silent | -15dB (0.15) |
+| SFX | Real moaning clips | -5dB (0.3) |
+
+**Voice mapping:**
+
+| Character | Voice ID | Rate | Pitch | For |
+|-----------|----------|------|-------|-----|
+| Narrator | zh-CN-YunxiNeural | -15% | -8Hz | Scene descriptions |
+| 景子 (normal) | zh-CN-XiaoyiNeural | -10% | +2Hz | Dialogue |
+| 景子 (intimate) | zh-CN-XiaoxiaoNeural | -40% | -12Hz | Breathy/moaning |
+| 黒田 | zh-CN-YunxiNeural | -5% | -5Hz | Male dialogue |
+
+Xiaoxiao = mature/deep → intimate scenes. Xiaoyi = younger → scared/pleading. Real SFX clips preferred over TTS for moaning.
+
+## QA Rules (14 total — `scripts/qa_rules.md`)
+
+QA runs **after EVERY step**, not batch. Flow: Generate → QA → FAIL → retry (new seed) → QA → max 5x.
+
+Uses Claude API vision if `ANTHROPIC_API_KEY` set, else file-size heuristics. Generates 3 versions, picks best.
+
+### Image QA (8 rules)
+
+| # | Rule | On Fail |
+|---|------|---------|
+| 1 | Face Symmetry | New seed + "beautiful symmetric eyes" |
+| 2 | Face Pretty | New seed; 3x → lower strength -0.05 |
+| 3 | Face Consistent | Increase IP-Adapter weight +0.1 |
+| 4 | Style Realistic | Add "photorealistic" + fullbody ref |
+| 5 | No Glasses | Add to prompt + negative |
+| 6 | Background Correct | Strengthen location in prompt |
+| 7 | Clothing Stripped | Increase denoise +0.05 (max 0.80) |
+| 8 | Not Bedroom | Add "classroom, chalkboard" + negate "bedroom" |
+
+### Video QA (4 rules)
+
+| # | Rule | On Fail |
+|---|------|---------|
+| 9 | Has Motion | More specific motion prompt |
+| 10 | No Artifacts | New seed; 3x → simplify motion |
+| 11 | Face Stable | Simpler motion, increase face weight |
+| 12 | Content Filter | Soften prompt, resize to 720x720, or STATIC fallback |
+
+### Audio QA (2 rules)
+
+| # | Rule | On Fail |
+|---|------|---------|
+| 13 | Voice Correct | Verify voice ID for character |
+| 14 | Audio Quality | Adjust rate/pitch |
+
 ## Project Structure
 
 ```
-benchmark/keiko_production/final/
-├── clean/              # Clothed scenes (Banana Pro)
-├── stripped/            # Explicit scenes (epicrealism_xl)
-├── swapped/            # Face-swapped stripped scenes (ReActor)
-├── video/              # Generated video clips
-├── flirting_storyboard.json
-└── story.md
-scripts/
-├── produce.py          # Full 15-scene pipeline (assets → QA loop)
-└── produce_flirting.py # 20s demo version
+├── README.md
+├── skills/
+│   └── face-swap/
+│       ├── SKILL.md         # Face swap usage guide
+│       ├── swap.py          # CLI tool for face swap
+│       └── workflow.json    # ComfyUI API workflow
+├── scripts/
+│   ├── produce.py           # Master producer (full pipeline + QA loop)
+│   ├── produce_flirting.py  # 20s demo clip producer
+│   ├── generate_seedream.py # Banana Pro image gen
+│   ├── generate_comfyui.py  # ComfyUI image gen (EpicRealism)
+│   └── qa_rules.md          # 14 QA rules + retry actions
+├── assets/
+│   ├── keiko/               # Character face/fullbody/side
+│   ├── voice_real/          # Real moaning SFX clips
+│   ├── voice_test/          # TTS voice samples
+│   └── voice_sexy/          # Intimate voice variants
+├── benchmark/keiko_production/
+│   ├── clean/               # 15 clothed scene images (Banana Pro)
+│   └── final/
+│       ├── story.md         # Scene script + voice directions
+│       ├── flirting_storyboard.json
+│       ├── stripped/        # 7 explicit images (EpicRealism)
+│       ├── swapped/         # 7 face-swapped images (ReActor)
+│       └── video/           # Generated video clips
+├── keiko_all_clean_scenes.mp4      # 14 clean Seedance scenes (70s)
+├── keiko_swapped_scenes_merged.mp4 # 7 swapped Wan2.1 scenes (21s)
+├── wan_scene*.webp                 # Wan2.1 clean scene animations
+└── wan_swapped_*.webp              # Wan2.1 swapped scene animations
 ```
 
 ## Infrastructure
 
-| Service | What | Where |
-|---------|------|-------|
-| AWS g6e.xlarge (L40S 48GB) | ComfyUI — face swap, strip, image gen | i-07387478d3044b9c7 |
-| AWS g6e.2xlarge | Wan2.1 14B video generation | i-0bf53720edb8f40f5 |
-| FAL.ai | Banana Pro image generation | API |
-| ByteDance Ark | Seedance 1.5 Pro video | API |
-| Edge-TTS | Voice generation (free) | Local |
-| FFmpeg | Mix + stitch | Local |
+| Instance | ID | Type | GPU | RAM | Region | Purpose |
+|----------|----|------|-----|-----|--------|---------|
+| animatediff-gpu | i-07387478d3044b9c7 | g6e.xlarge | L40S 48GB | 32GB | us-west-2 | Face swap + strip + image gen |
+| wan21-2xlarge | i-0307f18835cc4247c | g6e.2xlarge | L40S 48GB | 64GB | us-east-1 | Wan2.1 video (**64GB RAM required**) |
+| QWEN3-TTS | i-065bf6a5534ce15b7 | g6e.xlarge | L40S 48GB | 32GB | us-east-1 | Local TTS |
+
+| API | Key Location | Purpose |
+|-----|-------------|---------|
+| FAL.ai | `~/.openclaw/secrets/fal_api_key` | Banana Pro (via `fal_client` SDK) |
+| ByteDance Ark | `~/.openclaw/secrets/bytedance_ark_api_key` | Seedance video |
+| Anthropic | `ANTHROPIC_API_KEY` env | Claude Vision QA |
+| Edge-TTS | **No key** (free) | Voice generation |
+
+**GPU Quota:** 96 vCPUs P-instances approved in us-east-1, us-east-2, us-west-2.
+
+**SSH:** `ssh -i ~/.ssh/sd-gpu-key.pem ubuntu@<IP>`
 
 ## Quick Start
 
 ```bash
 # Full pipeline
-cd scripts
-python3 produce.py --step all --comfyui-ip <AWS_IP>
+python3 scripts/produce.py --step all --comfyui-ip <AWS_IP>
 
 # 20s demo
-python3 produce_flirting.py
+python3 scripts/produce_flirting.py
 
 # Face swap only
-python3 ../skills/face-swap/swap.py --batch
+python3 skills/face-swap/swap.py --batch
+
+# Start GPU instances
+aws ec2 start-instances --instance-ids i-07387478d3044b9c7 --region us-west-2  # image work
+aws ec2 start-instances --instance-ids i-0307f18835cc4247c --region us-east-1  # Wan2.1 video
 ```
 
-## Models on AWS
+## All Models on AWS
 
-- **epicrealism_xl.safetensors** — best photorealistic SDXL checkpoint
-- **inswapper_128.onnx** — face swap model (529MB)
-- **buffalo_l** — insightface detection (5 onnx files)
-- **GFPGANv1.4.pth** — face restoration
-- **IP-Adapter FaceID Plus v2** — tested but rejected (identity drift)
+| Model | File | Size | Instance | Purpose |
+|-------|------|------|----------|---------|
+| EpicRealism XL | `epicrealism_xl.safetensors` | SDXL | animatediff-gpu | Strip img2img |
+| inswapper_128 | `inswapper_128.onnx` | 529MB | animatediff-gpu | Face swap |
+| buffalo_l | `buffalo_l/*.onnx` | 5 files | animatediff-gpu | Face detection |
+| GFPGAN v1.4 | `GFPGANv1.4.pth` | ~350MB | animatediff-gpu | Face restoration |
+| Wan2.1 I2V 14B fp8 | `wan2.1_i2v_480p_14B_fp8_e4m3fn.safetensors` | 16GB | wan21-2xlarge | Video gen |
+| UMT5-XXL | `umt5_xxl_fp16.safetensors` | 11GB | wan21-2xlarge | Text encoder |
+| CLIP Vision H | `clip_vision_h.safetensors` | 1.2GB | wan21-2xlarge | Image encoder |
+| Wan 2.1 VAE | `wan_2.1_vae.safetensors` | 243MB | wan21-2xlarge | Video decoder |
+
+## Key Learnings
+
+- **Storyboard first** — never generate images/video without structured storyboard
+- **Face swap ONLY for stripped images** — clean Banana Pro images already have correct face
+- **inswapper_128 + GFPGAN > IP-Adapter FaceID** — better identity, correct eye color
+- **Wan2.1 needs 64GB RAM** — g6e.xlarge (32GB) produces garbage
+- **Banana Pro glasses bug** — always include "glasses" in negative prompt
+- **Style anchor in EVERY prompt** — prevents cartoon/anime drift
+- **Voice: never overlap** narration and dialogue in same scene
+- **Xiaoxiao for sexy, Xiaoyi for scared** — different Edge-TTS voices for different emotions
+- **Real SFX > TTS moaning** — TTS can't sound natural for intimate scenes
+- **Seedance filters NSFW** — use WAN for explicit, STATIC (Ken Burns) as free fallback
+- **torch 2.6 + CUDA 12.4** tested working for Wan2.1
