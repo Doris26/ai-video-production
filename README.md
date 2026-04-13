@@ -2,18 +2,19 @@
 
 Storyboard-first pipeline for generating realistic AI videos with consistent character identity.
 
-## Pipeline (7 Steps)
+## Pipeline (8 Steps)
 
-| Step | What | Tool | Cost |
-|------|------|------|------|
-| 0. Storyboard | JSON scene plan (duration, voice, motion) | Manual | Free |
-| 1. Assets | Face/fullbody/side per character + voice config | Banana Pro (FAL.ai) | ~$0.10/img |
-| 2. Images | One image per scene from storyboard | Banana Pro + epicrealism_xl (ComfyUI) | ~$0.10/img |
-| 3. Face Swap | Consistent face identity across all scenes | ReActor (inswapper_128 + GFPGAN v1.4) | Free (GPU) |
-| 4. Audio | TTS per scene + SFX mixing | Edge-TTS | Free |
-| 5. Video | Static (Ken Burns) / Seedance / Wan2.1 | FFmpeg / ByteDance / ComfyUI | $0–$2/clip |
-| 6. Mix | Merge video + audio + SFX per scene | FFmpeg | Free |
-| 7. Stitch | Concatenate all scenes → final video | FFmpeg | Free |
+| Step | What | Tool | Prompt / Config | QA Rules | On Fail |
+|------|------|------|-----------------|----------|---------|
+| **0. Storyboard** | JSON scene plan | Manual | Each scene: `scene_id`, `duration`, `image_desc`, `voice_type` (NARRATION/WOMEN_TALKING/MOANING/SILENCE), `voice_text`, `voice_character`, `sfx`, `video_type` (STATIC/SEEDANCE/WAN), `motion_prompt`, `explicit` | Total duration matches target; `voice_text` ≤ duration×5 chars; no overlapping voice types; `explicit:true` → `video_type:WAN`; every field filled | Split long narration into sub-scenes (01a, 01b) |
+| **1. Assets** | Face/fullbody/side per character + voice + SFX | Banana Pro (FAL.ai) | **Face**: `"Hyper-realistic close-up portrait headshot, {character desc}, plain light gray background, 8K"` (txt2img). **Fullbody**: same prompt, replace "headshot" → "full body head to toe" (img2img from face, strength=0.55). **Side**: replace "headshot" → "three-quarter side angle" (img2img, strength=0.45). **Voice**: Edge-TTS config per char. **SFX**: real audio clips for moaning | Face >50KB, ≥512x512; symmetric eyes; no glasses; correct ethnicity; fullbody+side match face identity; TTS 5s sample sounds correct; SFX plays clean | Regenerate with new seed; if 3x fail → adjust face prompt wording |
+| **2. Images** | One image per scene from storyboard `image_desc` | Banana Pro (`fal-ai/nano-banana-pro`) | **Prompt**: `{image_desc}. {STYLE_ANCHOR}` where STYLE_ANCHOR = `"smooth skin texture, clean detailed rendering, consistent bright lighting, same art style as reference image, hyper-realistic, NOT cartoon, NOT anime, 8K"`. **Negative**: `"ugly, deformed, cartoon, chibi, Disney, Pixar, blurry, kawaii, Western, blonde, anime, asymmetric eyes, glasses, dark mood, rough texture, grainy"`. **Params**: face ref image, strength=0.50, steps=30, guidance=7.0, 1024x1024 | R1: Face symmetry; R2: Face pretty; R3: Face matches ref; R4: Style realistic; R5: No glasses; R6: Background matches scene | R1→new seed+"symmetric eyes"; R2→new seed, 3x→lower strength; R3→increase ref weight; R4→add "photorealistic"+fullbody ref; R5→add "no glasses" to neg; R6→strengthen location desc |
+| **3a. Strip** | Remove clothing (explicit scenes only) | EpicRealism XL (ComfyUI img2img) | **Prompt**: `"Hyper-realistic, {char_desc}, topless nude, exposed breasts with pink nipples, {location}, NSFW, 8K"`. **Negative**: `"clothes, suit, jacket, blazer, blouse, shirt, bra, skirt, pants, dressed, covered, clothed, fabric"`. **Params**: denoise=0.65 (0.75 for stubborn) | R7: Clothing fully removed; R8: Setting is classroom not bedroom | R7→increase denoise+0.05 (max 0.80)+strengthen strip words; R8→add "classroom,chalkboard"+negate "bedroom,hotel,bed" |
+| **3b. Face Swap** | Fix face drift from strip (ONLY for stripped imgs) | ReActor (inswapper_128 + GFPGAN v1.4) via ComfyUI | **Source**: character face asset. **Target**: stripped image. **Config**: `swap_model=inswapper_128.onnx`, `facedetection=retinaface_resnet50`, `face_restore_model=GFPGANv1.4.pth`, `face_restore_visibility=1.0`. Speed: ~5s/image | R1-R3: Face symmetric + pretty + matches ref; no artifacts at blend seams; correct skin tone | Retry swap; if face asset quality low → regenerate asset |
+| **4. Audio** | TTS voice + SFX per scene | Edge-TTS (free) + real SFX clips | **Narrator**: `zh-CN-YunxiNeural` rate:-15% pitch:-8Hz. **景子 normal**: `zh-CN-XiaoyiNeural` rate:-10% pitch:+2Hz. **景子 intimate**: `zh-CN-XiaoxiaoNeural` rate:-40% pitch:-12Hz. **黒田**: `zh-CN-YunxiNeural` rate:-5% pitch:-5Hz. **MOANING**: use real SFX from `assets/voice_real/` (TTS moaning sounds robotic) | R13: Correct voice for character; R14: No clipping/static/echo; duration within ±0.5s of scene | R13→verify voice ID; R14→adjust rate/pitch; if TTS too long→trim with `atrim` |
+| **5. Video** | Animate images → clips | STATIC (FFmpeg) / SEEDANCE (ByteDance Ark) / WAN (ComfyUI) | **STATIC**: `ffmpeg -loop 1 -i img.png -vf "zoompan=z='min(zoom+0.001,1.3)':d=125:s=1024x1024" -t {dur} out.mp4`. **SEEDANCE**: Ark API, model=`doubao-seedance-1-5-pro`, input=720×720 JPEG, mute original audio. **WAN**: ComfyUI workflow `UNETLoader(fp8)→CLIPVisionEncode→WanImageToVideo[0,1,2]→KSampler(25 steps, cfg 5.0, euler)→VAEDecode`, 832×480, 49 frames@16fps, g6e.2xlarge (64GB RAM required) | R9: Has natural motion; R10: No face morphing/flickering; R11: Face stable throughout; R12: (Seedance) API returned valid video | R9→specific motion prompt; R10→new seed, 3x→simplify motion; R11→less face movement; R12→soften prompt+resize 720x720, or fallback STATIC |
+| **6. Mix** | Merge video + audio + SFX per scene | FFmpeg | **Voice only**: `ffmpeg -i video.mp4 -i voice.mp3 -c:v copy -c:a aac -map 0:v -map 1:a -shortest out.mp4`. **Voice+SFX**: `ffmpeg -i video.mp4 -i voice.mp3 -i sfx.mp3 -filter_complex "[1:a]volume=1.0,atrim=duration={dur}[v];[2:a]aloop=loop=-1,atrim=duration={dur},volume=0.15[s];[v][s]amix=inputs=2[out]" -map 0:v -map "[out]" out.mp4`. Layers: voice(1.0) + ambient(-15dB) + SFX(-5dB) | Audio-video in sync; voice audible over SFX; no clipping; duration matches scene | Re-trim audio; adjust SFX volume; re-encode if needed |
+| **7. Stitch** | Concat all scenes → final video | FFmpeg | `for f in mixed/*.mp4; do echo "file '$f'" >> concat.txt; done && ffmpeg -f concat -safe 0 -i concat.txt -c:v libx264 -crf 23 -c:a aac final.mp4` | Plays without errors; total duration matches storyboard; no glitches at transitions; audio continuous | Re-encode problem clips; add crossfade if needed |
 
 ## Face Swap (ReActor via ComfyUI)
 
@@ -99,146 +100,15 @@ workflow = {
 - `images/swapped/` — 21 face-swapped images (4 epic + 17 classroom)
 - `images/reactor_*.png` — 4 test scene swaps (cafe, beach, sakura, city)
 
-## Detailed Pipeline Flow
+## QA System
 
-```
-Step 0: STORYBOARD (JSON — source of truth)
-    ▼   QA: duration fits, voice_text ≤ duration×5 chars, no overlapping voices
-Step 1: ASSETS (characters + scenes + props + voice + SFX)
-    ▼   QA: face symmetric, no glasses, identity consistent across angles
-Step 2: IMAGES (Banana Pro with face ref + style anchor)
-    ▼   QA: Rules 1-6 (face, style, background) — auto-retry ≤5x
-Step 3: STRIP + FACE SWAP (explicit scenes only)
-    ▼   QA: Rules 7-8 (clothing removed, classroom kept) + Rules 1-3 (face)
-Step 4: AUDIO (Edge-TTS per character + real SFX)
-    ▼   QA: Rules 13-14 (correct voice, no artifacts)
-Step 5: VIDEO (STATIC / SEEDANCE / WAN per scene)
-    ▼   QA: Rules 9-12 (motion, artifacts, face stable, filter)
-Step 6: MIX (video + voice + ambient + SFX → per scene)
-    ▼   QA: sync, volume, no clipping
-Step 7: STITCH (concat all → final video)
-    ▼   QA: plays ok, total duration, no transition glitches
-```
+QA runs **after EVERY step**, not batch. Flow: `Generate → QA → FAIL → retry (new seed, adjusted params) → QA → max 5x then human review`.
 
-### Storyboard Format (Step 0)
-
-```json
-{
-  "scene_id": "01a",
-  "duration": 5,
-  "image_desc": "Woman walking through school gate, cherry blossoms",
-  "voice_type": "NARRATION | WOMEN_TALKING | MOANING | SILENCE",
-  "voice_text": "景子到任后立即成为学生的偶像。",
-  "voice_character": "narrator | keiko | kuroda",
-  "sfx": "morning_ambient | moaning_light | null",
-  "video_type": "STATIC | SEEDANCE | WAN",
-  "motion_prompt": "subtle head turn, gentle smile",
-  "explicit": false
-}
-```
-
-Rules:
-- `voice_text` fits duration (5s ≈ 25 Chinese chars)
-- Long narration → split into sub-scenes (01a, 01b, 01c)
-- Voice: EITHER narration OR dialogue — **NEVER overlapping**
-- `explicit: true` → `video_type: WAN` (Seedance filters NSFW)
-- `STATIC` = Ken Burns zoom/pan (free, no API)
-
-### Asset Categories (Step 1)
-
-| Category | What | Example |
-|----------|------|---------|
-| **Characters (角色)** | Face + fullbody + side per character | `keiko_face.png`, `keiko_fullbody.png` |
-| **Scenes (场景)** | Location backgrounds | Classroom, hallway, school gate |
-| **Props (道具)** | Consistent objects across scenes | Textbook, briefcase, chalk, coffee cup |
-| **Voice** | Edge-TTS config per character | `zh-CN-XiaoyiNeural` rate:-10% pitch:+2Hz |
-| **SFX** | Real audio clips for intimate scenes | `assets/voice_real/gfx_0.mp3` |
-
-Character asset flow: Face (txt2img) → Fullbody (img2img strength=0.55) → Side (img2img strength=0.45)
-
-### Image Generation (Step 2)
-
-**Style Anchor** (EVERY prompt):
-```
-smooth skin texture, clean detailed rendering, consistent bright lighting,
-same art style as reference image, hyper-realistic, NOT cartoon, NOT anime, 8K
-```
-
-**Global Negative** (ALWAYS):
-```
-ugly, deformed, cartoon, chibi, Disney, Pixar, blurry, cute, kawaii,
-Western, blonde, anime, asymmetric eyes, glasses, dark mood, rough texture, grainy
-```
-
-Banana Pro params: strength=0.50, steps=30, guidance=7.0, 1024x1024
-
-### Video Types (Step 5)
-
-| Type | When | How | Cost |
-|------|------|-----|------|
-| **STATIC** | Narration, close-ups | Ken Burns zoom/pan (FFmpeg) | Free |
-| **SEEDANCE** | Clean motion scenes | ByteDance Ark API (`doubao-seedance-1-5-pro`) | ~$0.01 |
-| **WAN** | Explicit motion scenes | ComfyUI on g6e.2xlarge (L40S, **64GB RAM required**) | ~$0.15 |
-
-Ken Burns: `ffmpeg -loop 1 -i img.png -vf "zoompan=z='min(zoom+0.001,1.3)':d=125:s=1024x1024" -t 5 out.mp4`
-
-Wan2.1: UNETLoader → CLIPVisionEncode → WanImageToVideo[0,1,2] → KSampler(25 steps) → VAEDecode
-
-### Audio Pipeline (Step 4 + Step 6)
-
-**3-layer mixing per scene:**
-
-| Layer | Source | Volume |
-|-------|--------|--------|
-| Voice | Edge-TTS (per character) | Full (1.0) |
-| Ambient | Seedance original or silent | -15dB (0.15) |
-| SFX | Real moaning clips | -5dB (0.3) |
-
-**Voice mapping:**
-
-| Character | Voice ID | Rate | Pitch | For |
-|-----------|----------|------|-------|-----|
-| Narrator | zh-CN-YunxiNeural | -15% | -8Hz | Scene descriptions |
-| 景子 (normal) | zh-CN-XiaoyiNeural | -10% | +2Hz | Dialogue |
-| 景子 (intimate) | zh-CN-XiaoxiaoNeural | -40% | -12Hz | Breathy/moaning |
-| 黒田 | zh-CN-YunxiNeural | -5% | -5Hz | Male dialogue |
-
-Xiaoxiao = mature/deep → intimate scenes. Xiaoyi = younger → scared/pleading. Real SFX clips preferred over TTS for moaning.
-
-## QA Rules (14 total — `scripts/qa_rules.md`)
-
-QA runs **after EVERY step**, not batch. Flow: Generate → QA → FAIL → retry (new seed) → QA → max 5x.
-
-Uses Claude API vision if `ANTHROPIC_API_KEY` set, else file-size heuristics. Generates 3 versions, picks best.
-
-### Image QA (8 rules)
-
-| # | Rule | On Fail |
-|---|------|---------|
-| 1 | Face Symmetry | New seed + "beautiful symmetric eyes" |
-| 2 | Face Pretty | New seed; 3x → lower strength -0.05 |
-| 3 | Face Consistent | Increase IP-Adapter weight +0.1 |
-| 4 | Style Realistic | Add "photorealistic" + fullbody ref |
-| 5 | No Glasses | Add to prompt + negative |
-| 6 | Background Correct | Strengthen location in prompt |
-| 7 | Clothing Stripped | Increase denoise +0.05 (max 0.80) |
-| 8 | Not Bedroom | Add "classroom, chalkboard" + negate "bedroom" |
-
-### Video QA (4 rules)
-
-| # | Rule | On Fail |
-|---|------|---------|
-| 9 | Has Motion | More specific motion prompt |
-| 10 | No Artifacts | New seed; 3x → simplify motion |
-| 11 | Face Stable | Simpler motion, increase face weight |
-| 12 | Content Filter | Soften prompt, resize to 720x720, or STATIC fallback |
-
-### Audio QA (2 rules)
-
-| # | Rule | On Fail |
-|---|------|---------|
-| 13 | Voice Correct | Verify voice ID for character |
-| 14 | Audio Quality | Adjust rate/pitch |
+- Uses **Claude API vision** if `ANTHROPIC_API_KEY` set, else file-size heuristics
+- Always generates **3 versions**, QA picks best, discards rest
+- Seed increments +1 per retry
+- All results logged to `qa_log.json`
+- Full rules: `scripts/qa_rules.md`
 
 ## Project Structure
 
