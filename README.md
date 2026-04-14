@@ -12,7 +12,7 @@ Storyboard-first pipeline for generating realistic AI videos with consistent cha
 | **3a. Strip** | Remove clothing (explicit scenes only) | EpicRealism XL (ComfyUI img2img) | **Prompt**: `"Hyper-realistic, {char_desc}, topless nude, exposed breasts with pink nipples, {location}, NSFW, 8K"`. **Negative**: `"clothes, suit, jacket, blazer, blouse, shirt, bra, skirt, pants, dressed, covered, clothed, fabric"`. **Params**: denoise=0.65 (0.75 for stubborn) | R7: Clothing fully removed; R8: Setting is classroom not bedroom | R7→increase denoise+0.05 (max 0.80)+strengthen strip words; R8→add "classroom,chalkboard"+negate "bedroom,hotel,bed" |
 | **3b. Face Swap** | Fix face drift from strip (ONLY for stripped imgs) | ReActor (inswapper_128 + GFPGAN v1.4) via ComfyUI | **Source**: character face asset. **Target**: stripped image. **Config**: `swap_model=inswapper_128.onnx`, `facedetection=retinaface_resnet50`, `face_restore_model=GFPGANv1.4.pth`, `face_restore_visibility=1.0`. Speed: ~5s/image | R1-R3: Face symmetric + pretty + matches ref; no artifacts at blend seams; correct skin tone | Retry swap; if face asset quality low → regenerate asset |
 | **4. Audio** | TTS voice + SFX per scene | Edge-TTS (free) + real SFX clips | **Narrator**: `zh-CN-YunxiNeural` rate:-15% pitch:-8Hz. **景子 normal**: `zh-CN-XiaoyiNeural` rate:-10% pitch:+2Hz. **景子 intimate**: `zh-CN-XiaoxiaoNeural` rate:-40% pitch:-12Hz. **黒田**: `zh-CN-YunxiNeural` rate:-5% pitch:-5Hz. **MOANING**: use real SFX from `assets/voice_real/` (TTS moaning sounds robotic) | R13: Correct voice for character; R14: No clipping/static/echo; duration within ±0.5s of scene | R13→verify voice ID; R14→adjust rate/pitch; if TTS too long→trim with `atrim` |
-| **5. Video** | Animate images → clips | STATIC (FFmpeg) / SEEDANCE (ByteDance Ark) / WAN (ComfyUI) | **STATIC**: `ffmpeg -loop 1 -i img.png -vf "zoompan=z='min(zoom+0.001,1.3)':d=125:s=1024x1024" -t {dur} out.mp4`. **SEEDANCE**: Ark API, model=`doubao-seedance-1-5-pro`, input=720×720 JPEG, mute original audio. **WAN**: ComfyUI workflow `UNETLoader(fp8)→CLIPVisionEncode→WanImageToVideo[0,1,2]→KSampler(25 steps, cfg 5.0, euler)→VAEDecode`, 832×480, 49 frames@16fps, g6e.2xlarge (64GB RAM required) | R9: Has natural motion; R10: No face morphing/flickering; R11: Face stable throughout; R12: (Seedance) API returned valid video | R9→specific motion prompt; R10→new seed, 3x→simplify motion; R11→less face movement; R12→soften prompt+resize 720x720, or fallback STATIC |
+| **5. Video** | Animate images → clips | STATIC (FFmpeg) / SEEDANCE (ByteDance Ark) / WAN (ComfyUI) | **STATIC**: `ffmpeg -loop 1 -i img.png -vf "zoompan=z='min(zoom+0.001,1.3)':d=125:s=1024x1024" -t {dur} out.mp4`. **SEEDANCE**: Ark API, model=`doubao-seedance-1-5-pro`, input=720×720 JPEG, mute original audio. **WAN 2.2**: ComfyUI workflow `UNETLoader(wan2.2_ti2v_5B_fp16)→CLIPVisionEncode→Wan22ImageToVideoLatent+WanImageToVideo→KSampler(25 steps, cfg 5.0, euler)→VAEDecode`, 832×480, 49 frames@24fps, **~28s per clip** on g6e.2xlarge (20GB VRAM, fits easily in 48GB) | R9: Has natural motion; R10: No face morphing/flickering; R11: Face stable throughout; R12: (Seedance) API returned valid video | R9→specific motion prompt; R10→new seed, 3x→simplify motion; R11→less face movement; R12→soften prompt+resize 720x720, or fallback STATIC |
 | **6. Mix** | Merge video + audio + SFX per scene | FFmpeg | **Voice only**: `ffmpeg -i video.mp4 -i voice.mp3 -c:v copy -c:a aac -map 0:v -map 1:a -shortest out.mp4`. **Voice+SFX**: `ffmpeg -i video.mp4 -i voice.mp3 -i sfx.mp3 -filter_complex "[1:a]volume=1.0,atrim=duration={dur}[v];[2:a]aloop=loop=-1,atrim=duration={dur},volume=0.15[s];[v][s]amix=inputs=2[out]" -map 0:v -map "[out]" out.mp4`. Layers: voice(1.0) + ambient(-15dB) + SFX(-5dB) | Audio-video in sync; voice audible over SFX; no clipping; duration matches scene | Re-trim audio; adjust SFX volume; re-encode if needed |
 | **7. Stitch** | Concat all scenes → final video | FFmpeg | `for f in mixed/*.mp4; do echo "file '$f'" >> concat.txt; done && ffmpeg -f concat -safe 0 -i concat.txt -c:v libx264 -crf 23 -c:a aac final.mp4` | Plays without errors; total duration matches storyboard; no glitches at transitions; audio continuous | Re-encode problem clips; add crossfade if needed |
 
@@ -188,21 +188,22 @@ aws ec2 start-instances --instance-ids i-0307f18835cc4247c --region us-east-1  #
 | inswapper_128 | `inswapper_128.onnx` | 529MB | animatediff-gpu | Face swap |
 | buffalo_l | `buffalo_l/*.onnx` | 5 files | animatediff-gpu | Face detection |
 | GFPGAN v1.4 | `GFPGANv1.4.pth` | ~350MB | animatediff-gpu | Face restoration |
-| Wan2.1 I2V 14B fp8 | `wan2.1_i2v_480p_14B_fp8_e4m3fn.safetensors` | 16GB | wan21-2xlarge | Video gen |
-| UMT5-XXL | `umt5_xxl_fp16.safetensors` | 11GB | wan21-2xlarge | Text encoder |
+| Wan2.2 TI2V-5B | `wan2.2_ti2v_5B_fp16.safetensors` | 9.4GB | wan21-2xlarge | Video gen (5B params, fp16) |
+| UMT5-XXL fp8 | `umt5_xxl_fp8_e4m3fn_scaled.safetensors` | 6.3GB | wan21-2xlarge | Text encoder |
 | CLIP Vision H | `clip_vision_h.safetensors` | 1.2GB | wan21-2xlarge | Image encoder |
-| Wan 2.1 VAE | `wan_2.1_vae.safetensors` | 243MB | wan21-2xlarge | Video decoder |
+| Wan 2.2 VAE | `wan2.2_vae.safetensors` | 1.4GB | wan21-2xlarge | Video decoder (16×16×4 compression) |
 
 ## Key Learnings
 
 - **Storyboard first** — never generate images/video without structured storyboard
 - **Face swap ONLY for stripped images** — clean Banana Pro images already have correct face
 - **inswapper_128 + GFPGAN > IP-Adapter FaceID** — better identity, correct eye color
-- **Wan2.1 needs 64GB RAM** — g6e.xlarge (32GB) produces garbage
+- **Wan 2.2 TI2V-5B replaces Wan 2.1 14B** — 12x faster (28s vs 5min), 9.4GB vs 16GB, no fp8 garbage, fits on any 48GB GPU
 - **Banana Pro glasses bug** — always include "glasses" in negative prompt
 - **Style anchor in EVERY prompt** — prevents cartoon/anime drift
 - **Voice: never overlap** narration and dialogue in same scene
 - **Xiaoxiao for sexy, Xiaoyi for scared** — different Edge-TTS voices for different emotions
 - **Real SFX > TTS moaning** — TTS can't sound natural for intimate scenes
 - **Seedance filters NSFW** — use WAN for explicit, STATIC (Ken Burns) as free fallback
-- **torch 2.6 + CUDA 12.4** tested working for Wan2.1
+- **torch 2.6 + CUDA 12.4** tested working for Wan 2.2
+- **Wan 2.2 models** from [Comfy-Org/Wan_2.2_ComfyUI_Repackaged](https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged)
